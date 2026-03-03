@@ -224,6 +224,12 @@ class KolkhisHandle:
 class KolkhisConnectionManager(SQLConnectionManager):
     TYPE = "kolkhis"
 
+    def begin(self):
+        pass
+
+    def commit(self):
+        pass
+
     @classmethod
     def open(cls, connection: Connection) -> Connection:
         if connection.state == ConnectionState.OPEN:
