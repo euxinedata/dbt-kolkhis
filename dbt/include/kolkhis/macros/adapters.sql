@@ -76,8 +76,13 @@
 
 {% macro kolkhis__rename_relation(from_relation, to_relation) %}
     {%- call statement('rename_relation') -%}
-        alter table {{ from_relation.include(database=false) }}
-        rename to {{ to_relation.include(database=false, schema=false) }}
+        {% if from_relation.type == 'view' %}
+            alter view {{ from_relation.include(database=false) }}
+            rename to {{ to_relation.include(database=false, schema=false) }}
+        {% else %}
+            alter table {{ from_relation.include(database=false) }}
+            rename to {{ to_relation.include(database=false, schema=false) }}
+        {% endif %}
     {%- endcall -%}
 {% endmacro %}
 
