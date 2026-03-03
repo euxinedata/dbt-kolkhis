@@ -210,19 +210,16 @@ class KolkhisHandle:
         )
 
     def close(self):
-        headers = {"Authorization": f"Bearer {self.auth_token}"}
-        try:
-            with httpx.Client(timeout=10) as client:
-                client.delete(
-                    f"{self.worker_url}/session/{self.session_id}",
-                    headers=headers,
-                )
-        except Exception:
-            pass
+        # Don't delete the shared session — it's reused across connections
+        pass
 
 
 class KolkhisConnectionManager(SQLConnectionManager):
     TYPE = "kolkhis"
+
+    # Shared worker session across all dbt connections
+    _shared_session_id: Optional[str] = None
+    _shared_config: Optional[dict] = None
 
     def begin(self):
         connection = self.get_thread_connection()
@@ -247,30 +244,30 @@ class KolkhisConnectionManager(SQLConnectionManager):
         headers = {"Authorization": f"Bearer {credentials.auth_token}"}
 
         try:
-            # Fetch session config from the backend
-            with httpx.Client(timeout=30) as client:
-                resp = client.get(
-                    f"{credentials.backend_url}/api/dbt/session-config",
-                    headers=headers,
-                )
-                resp.raise_for_status()
-                config = resp.json()
+            # Create one shared worker session for the entire dbt run
+            if cls._shared_session_id is None:
+                with httpx.Client(timeout=30) as client:
+                    resp = client.get(
+                        f"{credentials.backend_url}/api/dbt/session-config",
+                        headers=headers,
+                    )
+                    resp.raise_for_status()
+                    cls._shared_config = resp.json()
 
-            # Create a worker session
-            with httpx.Client(timeout=30) as client:
-                resp = client.post(
-                    f"{credentials.worker_url}/session",
-                    json={
-                        "catalog_objects": config["catalog_objects"],
-                        "s3": config["s3"],
-                    },
-                    headers=headers,
-                )
-                resp.raise_for_status()
-                session_id = resp.json()["session_id"]
+                with httpx.Client(timeout=30) as client:
+                    resp = client.post(
+                        f"{credentials.worker_url}/session",
+                        json={
+                            "catalog_objects": cls._shared_config["catalog_objects"],
+                            "s3": cls._shared_config["s3"],
+                        },
+                        headers=headers,
+                    )
+                    resp.raise_for_status()
+                    cls._shared_session_id = resp.json()["session_id"]
 
             connection.handle = KolkhisHandle(
-                credentials.worker_url, session_id, credentials.auth_token,
+                credentials.worker_url, cls._shared_session_id, credentials.auth_token,
                 credentials.backend_url, credentials.database or "kolkhis",
             )
             connection.state = ConnectionState.OPEN
