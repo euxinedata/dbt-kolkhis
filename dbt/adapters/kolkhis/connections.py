@@ -16,6 +16,8 @@ from dbt_common.exceptions import DbtRuntimeError
 
 logger = logging.getLogger(__name__)
 
+_COMMENT_RE = re.compile(r'^\s*/\*.*?\*/\s*', re.DOTALL)
+
 _CREATE_TABLE_RE = re.compile(
     r'^\s*CREATE\s+TABLE\s+"([^"]+)"\."([^"]+)"\s+AS\s+',
     re.IGNORECASE,
@@ -94,23 +96,34 @@ class KolkhisCursor:
 
     def _persist(self, sql: str, headers: dict):
         """Detect CREATE TABLE/VIEW/DROP and persist to Iceberg catalog."""
+        # Strip leading dbt comment (/* {"app": "dbt", ...} */)
+        clean_sql = _COMMENT_RE.sub('', sql)
+
         try:
-            m = _CREATE_TABLE_RE.match(sql)
+            m = _CREATE_TABLE_RE.match(clean_sql)
             if m:
                 schema_name, table_name = m.group(1), m.group(2)
+                table_name = table_name.removesuffix("__dbt_tmp")
+                if table_name.endswith("__dbt_backup"):
+                    return
                 self._materialize_table(schema_name, table_name, headers)
                 return
 
-            m = _CREATE_VIEW_RE.match(sql)
+            m = _CREATE_VIEW_RE.match(clean_sql)
             if m:
                 schema_name, view_name = m.group(1), m.group(2)
-                view_sql = m.group(3).strip().rstrip(";")
+                view_name = view_name.removesuffix("__dbt_tmp")
+                if view_name.endswith("__dbt_backup"):
+                    return
+                view_sql = m.group(3).strip().rstrip(";").strip().rstrip(")")
                 self._register_view(schema_name, view_name, view_sql, headers)
                 return
 
-            m = _DROP_RE.match(sql)
+            m = _DROP_RE.match(clean_sql)
             if m:
                 obj_type, schema_name, name = m.group(1).lower(), m.group(2), m.group(3)
+                if name.endswith("__dbt_tmp") or name.endswith("__dbt_backup"):
+                    return
                 self._drop_object(schema_name, name, obj_type, headers)
                 return
         except Exception as exc:
