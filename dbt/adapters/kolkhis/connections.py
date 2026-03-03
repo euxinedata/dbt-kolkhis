@@ -138,7 +138,7 @@ class KolkhisCursor:
                 files={"arrow_data": ("data.arrow", arrow_bytes, "application/vnd.apache.arrow.stream")},
                 data={
                     "database": self._database,
-                    "schema": schema_name,
+                    "schema_name": schema_name,
                     "table_name": table_name,
                 },
             )
