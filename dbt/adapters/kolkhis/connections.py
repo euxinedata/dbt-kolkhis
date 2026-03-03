@@ -1,3 +1,5 @@
+import logging
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Optional, Tuple
@@ -11,6 +13,23 @@ from dbt.adapters.contracts.connection import (
 )
 from dbt.adapters.sql.connections import SQLConnectionManager
 from dbt_common.exceptions import DbtRuntimeError
+
+logger = logging.getLogger(__name__)
+
+_CREATE_TABLE_RE = re.compile(
+    r'^\s*CREATE\s+TABLE\s+"([^"]+)"\."([^"]+)"\s+AS\s+',
+    re.IGNORECASE,
+)
+
+_CREATE_VIEW_RE = re.compile(
+    r'^\s*CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+"([^"]+)"\."([^"]+)"\s+AS\s+(.+)',
+    re.IGNORECASE | re.DOTALL,
+)
+
+_DROP_RE = re.compile(
+    r'^\s*DROP\s+(TABLE|VIEW)\s+IF\s+EXISTS\s+"([^"]+)"\."([^"]+)"',
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -34,10 +53,13 @@ class KolkhisCredentials(Credentials):
 class KolkhisCursor:
     """DB-API 2.0 style cursor that routes SQL through the worker session HTTP API."""
 
-    def __init__(self, worker_url: str, session_id: str, auth_token: str):
+    def __init__(self, worker_url: str, session_id: str, auth_token: str,
+                 backend_url: str = "", database: str = "kolkhis"):
         self._worker_url = worker_url
         self._session_id = session_id
         self._auth_token = auth_token
+        self._backend_url = backend_url
+        self._database = database
         self.description: Optional[list] = None
         self._rows: list = []
         self.rowcount: int = -1
@@ -66,6 +88,93 @@ class KolkhisCursor:
         self._rows = [tuple(row) for row in rows]
         self.rowcount = data.get("row_count", len(self._rows))
 
+        # Persist materializations to Iceberg catalog
+        if self._backend_url:
+            self._persist(sql, headers)
+
+    def _persist(self, sql: str, headers: dict):
+        """Detect CREATE TABLE/VIEW/DROP and persist to Iceberg catalog."""
+        try:
+            m = _CREATE_TABLE_RE.match(sql)
+            if m:
+                schema_name, table_name = m.group(1), m.group(2)
+                self._materialize_table(schema_name, table_name, headers)
+                return
+
+            m = _CREATE_VIEW_RE.match(sql)
+            if m:
+                schema_name, view_name = m.group(1), m.group(2)
+                view_sql = m.group(3).strip().rstrip(";")
+                self._register_view(schema_name, view_name, view_sql, headers)
+                return
+
+            m = _DROP_RE.match(sql)
+            if m:
+                obj_type, schema_name, name = m.group(1).lower(), m.group(2), m.group(3)
+                self._drop_object(schema_name, name, obj_type, headers)
+                return
+        except Exception as exc:
+            logger.warning("Failed to persist materialization: %s", exc)
+
+    def _materialize_table(self, schema_name: str, table_name: str, headers: dict):
+        """Export Arrow from worker, send to backend for Iceberg persistence."""
+        duckdb_table = f'"{schema_name}"."{table_name}"'
+
+        # Get Arrow bytes from worker
+        with httpx.Client(timeout=300) as client:
+            resp = client.post(
+                f"{self._worker_url}/session/{self._session_id}/export-arrow",
+                json={"table": duckdb_table},
+                headers=headers,
+            )
+            resp.raise_for_status()
+            arrow_bytes = resp.content
+
+        # Send to backend for Iceberg write
+        with httpx.Client(timeout=300) as client:
+            resp = client.post(
+                f"{self._backend_url}/api/dbt/materialize",
+                headers=headers,
+                files={"arrow_data": ("data.arrow", arrow_bytes, "application/vnd.apache.arrow.stream")},
+                data={
+                    "database": self._database,
+                    "schema": schema_name,
+                    "table_name": table_name,
+                },
+            )
+            resp.raise_for_status()
+        logger.info("Materialized table %s.%s.%s", self._database, schema_name, table_name)
+
+    def _register_view(self, schema_name: str, view_name: str, view_sql: str, headers: dict):
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
+                f"{self._backend_url}/api/dbt/register-view",
+                json={
+                    "database": self._database,
+                    "schema_name": schema_name,
+                    "view_name": view_name,
+                    "view_sql": view_sql,
+                },
+                headers=headers,
+            )
+            resp.raise_for_status()
+        logger.info("Registered view %s.%s.%s", self._database, schema_name, view_name)
+
+    def _drop_object(self, schema_name: str, name: str, obj_type: str, headers: dict):
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
+                f"{self._backend_url}/api/dbt/drop-object",
+                json={
+                    "database": self._database,
+                    "schema_name": schema_name,
+                    "name": name,
+                    "object_type": obj_type,
+                },
+                headers=headers,
+            )
+            resp.raise_for_status()
+        logger.info("Dropped %s %s.%s.%s", obj_type, self._database, schema_name, name)
+
     def fetchall(self):
         return self._rows
 
@@ -86,13 +195,19 @@ class KolkhisCursor:
 class KolkhisHandle:
     """Connection handle that creates cursors for the worker session."""
 
-    def __init__(self, worker_url: str, session_id: str, auth_token: str):
+    def __init__(self, worker_url: str, session_id: str, auth_token: str,
+                 backend_url: str = "", database: str = "kolkhis"):
         self.worker_url = worker_url
         self.session_id = session_id
         self.auth_token = auth_token
+        self.backend_url = backend_url
+        self.database = database
 
     def cursor(self):
-        return KolkhisCursor(self.worker_url, self.session_id, self.auth_token)
+        return KolkhisCursor(
+            self.worker_url, self.session_id, self.auth_token,
+            self.backend_url, self.database,
+        )
 
     def close(self):
         headers = {"Authorization": f"Bearer {self.auth_token}"}
@@ -141,7 +256,8 @@ class KolkhisConnectionManager(SQLConnectionManager):
                 session_id = resp.json()["session_id"]
 
             connection.handle = KolkhisHandle(
-                credentials.worker_url, session_id, credentials.auth_token
+                credentials.worker_url, session_id, credentials.auth_token,
+                credentials.backend_url, credentials.database or "kolkhis",
             )
             connection.state = ConnectionState.OPEN
 
