@@ -64,17 +64,21 @@
 
 
 {% macro kolkhis__drop_relation(relation) %}
-    {% if relation.type == 'view' %}
-        drop view if exists {{ relation.include(database=false) }}
-    {% elif relation.type == 'table' %}
-        drop table if exists {{ relation.include(database=false) }}
-    {% endif %}
+    {%- call statement('drop_relation', auto_begin=False) -%}
+        {% if relation.type == 'view' %}
+            drop view if exists {{ relation.include(database=false) }}
+        {% elif relation.type == 'table' %}
+            drop table if exists {{ relation.include(database=false) }}
+        {% endif %}
+    {%- endcall -%}
 {% endmacro %}
 
 
 {% macro kolkhis__rename_relation(from_relation, to_relation) %}
-    alter table {{ from_relation.include(database=false) }}
-    rename to {{ to_relation.include(database=false, schema=false) }}
+    {%- call statement('rename_relation') -%}
+        alter table {{ from_relation.include(database=false) }}
+        rename to {{ to_relation.include(database=false, schema=false) }}
+    {%- endcall -%}
 {% endmacro %}
 
 
