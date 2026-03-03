@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dbt-kolkhis"
+version = "0.1.0"
+description = "dbt adapter for Kolkhis DuckDB worker"
+requires-python = ">=3.10"
+dependencies = [
+    "dbt-core>=1.8",
+    "dbt-adapters>=1,<2",
+    "dbt-common>=1,<2",
+    "httpx",
+]
+
+[tool.setuptools.packages.find]
+include = ["dbt", "dbt.*"]
+namespaces = true
+
+[tool.setuptools.package-data]
+"dbt.include.kolkhis" = ["**/*.sql", "**/*.yml", "*.sql", "*.yml"]
