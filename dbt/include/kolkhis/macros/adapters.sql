@@ -7,6 +7,7 @@
     {% set sql %}
         select schema_name
         from information_schema.schemata
+        where catalog_name = current_database()
     {% endset %}
     {{ return(run_query(sql)) }}
 {% endmacro %}
@@ -25,6 +26,7 @@
             end as type
         from information_schema.tables
         where table_schema = '{{ schema_relation.schema }}'
+          and table_catalog = current_database()
     {% endset %}
     {{ return(run_query(sql)) }}
 {% endmacro %}
