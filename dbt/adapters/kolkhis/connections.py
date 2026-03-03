@@ -102,11 +102,11 @@ class KolkhisCursor:
         try:
             m = _CREATE_TABLE_RE.match(clean_sql)
             if m:
-                schema_name, table_name = m.group(1), m.group(2)
-                table_name = table_name.removesuffix("__dbt_tmp")
+                schema_name, duckdb_name = m.group(1), m.group(2)
+                table_name = duckdb_name.removesuffix("__dbt_tmp")
                 if table_name.endswith("__dbt_backup"):
                     return
-                self._materialize_table(schema_name, table_name, headers)
+                self._materialize_table(schema_name, table_name, duckdb_name, headers)
                 return
 
             m = _CREATE_VIEW_RE.match(clean_sql)
@@ -129,9 +129,10 @@ class KolkhisCursor:
         except Exception as exc:
             logger.warning("Failed to persist materialization: %s", exc)
 
-    def _materialize_table(self, schema_name: str, table_name: str, headers: dict):
+    def _materialize_table(self, schema_name: str, table_name: str,
+                           duckdb_name: str, headers: dict):
         """Export Arrow from worker, send to backend for Iceberg persistence."""
-        duckdb_table = f'"{schema_name}"."{table_name}"'
+        duckdb_table = f'"{schema_name}"."{duckdb_name}"'
 
         # Get Arrow bytes from worker
         with httpx.Client(timeout=300) as client:
