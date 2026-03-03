@@ -225,10 +225,18 @@ class KolkhisConnectionManager(SQLConnectionManager):
     TYPE = "kolkhis"
 
     def begin(self):
-        pass
+        connection = self.get_thread_connection()
+        if connection.transaction_open is True:
+            return connection
+        connection.transaction_open = True
+        return connection
 
     def commit(self):
-        pass
+        connection = self.get_thread_connection()
+        if connection.transaction_open is False:
+            return connection
+        connection.transaction_open = False
+        return connection
 
     @classmethod
     def open(cls, connection: Connection) -> Connection:
