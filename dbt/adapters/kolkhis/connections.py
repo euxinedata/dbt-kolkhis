@@ -260,6 +260,7 @@ class KolkhisConnectionManager(SQLConnectionManager):
                         json={
                             "catalog_objects": cls._shared_config["catalog_objects"],
                             "s3": cls._shared_config["s3"],
+                            "use_databases": True,
                         },
                         headers=headers,
                     )
