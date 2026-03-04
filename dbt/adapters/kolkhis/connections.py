@@ -40,6 +40,7 @@ class KolkhisCredentials(Credentials):
     backend_url: str = "http://localhost:8000"
     worker_url: str = "http://localhost:8080"
     auth_token: str = ""
+    user_id: int = 0
 
     @property
     def type(self) -> str:
@@ -50,18 +51,19 @@ class KolkhisCredentials(Credentials):
         return self.worker_url
 
     def _connection_keys(self) -> Tuple[str, ...]:
-        return ("backend_url", "worker_url", "database", "schema")
+        return ("backend_url", "worker_url", "user_id", "database", "schema")
 
 
 class KolkhisCursor:
     """DB-API 2.0 style cursor that routes SQL through the worker session HTTP API."""
 
     def __init__(self, worker_url: str, session_id: str, auth_token: str,
-                 backend_url: str = ""):
+                 backend_url: str = "", user_id: int = 0):
         self._worker_url = worker_url
         self._session_id = session_id
         self._auth_token = auth_token
         self._backend_url = backend_url
+        self._user_id = user_id
         self.description: Optional[list] = None
         self._rows: list = []
         self.rowcount: int = -1
@@ -73,8 +75,8 @@ class KolkhisCursor:
         headers = {"Authorization": f"Bearer {self._auth_token}"}
         with httpx.Client(timeout=300) as client:
             resp = client.post(
-                f"{self._worker_url}/session/{self._session_id}/query",
-                json={"sql": sql, "fetch_results": True},
+                f"{self._backend_url}/api/dbt/session/{self._session_id}/query",
+                json={"sql": sql, "fetch_results": True, "user_id": self._user_id},
                 headers=headers,
             )
             resp.raise_for_status()
@@ -213,16 +215,17 @@ class KolkhisHandle:
     """Connection handle that creates cursors for the worker session."""
 
     def __init__(self, worker_url: str, session_id: str, auth_token: str,
-                 backend_url: str = ""):
+                 backend_url: str = "", user_id: int = 0):
         self.worker_url = worker_url
         self.session_id = session_id
         self.auth_token = auth_token
         self.backend_url = backend_url
+        self.user_id = user_id
 
     def cursor(self):
         return KolkhisCursor(
             self.worker_url, self.session_id, self.auth_token,
-            self.backend_url,
+            self.backend_url, self.user_id,
         )
 
     def close(self):
@@ -288,7 +291,7 @@ class KolkhisConnectionManager(SQLConnectionManager):
 
             connection.handle = KolkhisHandle(
                 credentials.worker_url, cls._shared_session_id, credentials.auth_token,
-                credentials.backend_url,
+                credentials.backend_url, credentials.user_id,
             )
             connection.state = ConnectionState.OPEN
 
