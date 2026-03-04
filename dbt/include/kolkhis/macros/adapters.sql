@@ -52,7 +52,7 @@
 
 {% macro kolkhis__create_table_as(temporary, relation, sql) %}
     create {% if temporary -%}temporary {%- endif %} table
-        {{ relation }}
+        {{ relation.include(database=(not temporary), schema=(not temporary)) }}
     as (
         {{ sql }}
     )
