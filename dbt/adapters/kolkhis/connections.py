@@ -1,6 +1,7 @@
 import atexit
 import logging
 import re
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
@@ -38,8 +39,8 @@ _DROP_RE = re.compile(
 @dataclass
 class KolkhisCredentials(Credentials):
     backend_url: str = "http://localhost:8000"
-    worker_url: str = "http://localhost:8080"
     auth_token: str = ""
+    worker_url: str = ""  # Deprecated: kept for backward compatibility with existing profiles
 
     @property
     def type(self) -> str:
@@ -47,22 +48,19 @@ class KolkhisCredentials(Credentials):
 
     @property
     def unique_field(self) -> str:
-        return self.worker_url
+        return self.backend_url
 
     def _connection_keys(self) -> Tuple[str, ...]:
-        return ("backend_url", "worker_url", "database", "schema")
+        return ("backend_url", "database", "schema")
 
 
 class KolkhisCursor:
-    """DB-API 2.0 style cursor that routes SQL through the worker session HTTP API."""
+    """DB-API 2.0 style cursor that routes SQL through the backend."""
 
-    def __init__(self, worker_url: str, session_id: str, auth_token: str,
-                 backend_url: str = "", worker_auth_token: str = ""):
-        self._worker_url = worker_url
+    def __init__(self, backend_url: str, session_id: str, auth_token: str):
+        self._backend_url = backend_url
         self._session_id = session_id
         self._auth_token = auth_token
-        self._backend_url = backend_url
-        self._worker_auth_token = worker_auth_token
         self.description: Optional[list] = None
         self._rows: list = []
         self.rowcount: int = -1
@@ -71,12 +69,12 @@ class KolkhisCursor:
         if bindings:
             raise DbtRuntimeError("Parameterized queries not supported by Kolkhis adapter")
 
-        backend_headers = {"Authorization": f"Bearer {self._auth_token}"}
+        headers = {"Authorization": f"Bearer {self._auth_token}"}
         with httpx.Client(timeout=300) as client:
             resp = client.post(
                 f"{self._backend_url}/api/dbt/session/{self._session_id}/query",
                 json={"sql": sql, "fetch_results": True},
-                headers=backend_headers,
+                headers=headers,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -92,8 +90,7 @@ class KolkhisCursor:
         self.rowcount = data.get("row_count", len(self._rows))
 
         # Persist materializations to Iceberg catalog
-        if self._backend_url:
-            self._persist(sql, backend_headers)
+        self._persist(sql, headers)
 
     def _persist(self, sql: str, headers: dict):
         """Detect CREATE TABLE/VIEW/DROP and persist to Iceberg catalog."""
@@ -133,31 +130,18 @@ class KolkhisCursor:
 
     def _materialize_table(self, db_name: str, schema_name: str, table_name: str,
                            duckdb_name: str, headers: dict):
-        """Export Arrow from worker, send to backend for Iceberg persistence."""
+        """Tell the backend to export Arrow from worker and persist to Iceberg."""
         duckdb_table = f'"{db_name}"."{schema_name}"."{duckdb_name}"'
-
-        # Get Arrow bytes from worker (use worker auth token)
-        worker_headers = {"Authorization": f"Bearer {self._worker_auth_token}"}
         with httpx.Client(timeout=300) as client:
             resp = client.post(
-                f"{self._worker_url}/session/{self._session_id}/export-arrow",
-                json={"table": duckdb_table},
-                headers=worker_headers,
-            )
-            resp.raise_for_status()
-            arrow_bytes = resp.content
-
-        # Send to backend for Iceberg write (use per-user auth token)
-        with httpx.Client(timeout=300) as client:
-            resp = client.post(
-                f"{self._backend_url}/api/dbt/materialize",
-                headers=headers,
-                files={"arrow_data": ("data.arrow", arrow_bytes, "application/vnd.apache.arrow.stream")},
-                data={
+                f"{self._backend_url}/api/dbt/session/{self._session_id}/materialize",
+                json={
                     "database": db_name,
                     "schema_name": schema_name,
                     "table_name": table_name,
+                    "duckdb_table": duckdb_table,
                 },
+                headers=headers,
             )
             resp.raise_for_status()
         logger.info("Materialized table %s.%s.%s", db_name, schema_name, table_name)
@@ -214,19 +198,13 @@ class KolkhisCursor:
 class KolkhisHandle:
     """Connection handle that creates cursors for the worker session."""
 
-    def __init__(self, worker_url: str, session_id: str, auth_token: str,
-                 backend_url: str = "", worker_auth_token: str = ""):
-        self.worker_url = worker_url
+    def __init__(self, backend_url: str, session_id: str, auth_token: str):
+        self.backend_url = backend_url
         self.session_id = session_id
         self.auth_token = auth_token
-        self.backend_url = backend_url
-        self.worker_auth_token = worker_auth_token
 
     def cursor(self):
-        return KolkhisCursor(
-            self.worker_url, self.session_id, self.auth_token,
-            self.backend_url, self.worker_auth_token,
-        )
+        return KolkhisCursor(self.backend_url, self.session_id, self.auth_token)
 
     def close(self):
         pass
@@ -237,7 +215,6 @@ class KolkhisConnectionManager(SQLConnectionManager):
 
     # Shared worker session across all dbt connections
     _shared_session_id: Optional[str] = None
-    _shared_config: Optional[dict] = None
     _cleanup_registered: bool = False
 
     def begin(self):
@@ -265,37 +242,47 @@ class KolkhisConnectionManager(SQLConnectionManager):
         try:
             # Create one shared worker session for the entire dbt run
             if cls._shared_session_id is None:
-                with httpx.Client(timeout=30) as client:
-                    resp = client.get(
-                        f"{credentials.backend_url}/api/dbt/session-config",
+                with httpx.Client(timeout=300) as client:
+                    # Request session creation (backend provisions worker if needed)
+                    resp = client.post(
+                        f"{credentials.backend_url}/api/dbt/session",
                         headers=headers,
                     )
                     resp.raise_for_status()
-                    cls._shared_config = resp.json()
+                    data = resp.json()
 
-                # Use worker auth token (from backend) for worker calls
-                worker_token = cls._shared_config.get("worker_auth_token", credentials.auth_token)
-                worker_headers = {"Authorization": f"Bearer {worker_token}"}
-                with httpx.Client(timeout=30) as client:
-                    resp = client.post(
-                        f"{credentials.worker_url}/session",
-                        json={
-                            "catalog_objects": cls._shared_config["catalog_objects"],
-                            "s3": cls._shared_config["s3"],
-                        },
-                        headers=worker_headers,
-                    )
-                    resp.raise_for_status()
-                    cls._shared_session_id = resp.json()["session_id"]
+                    # If worker is provisioning, poll until ready
+                    if resp.status_code == 202:
+                        logger.info("Worker is being provisioned...")
+                        while True:
+                            time.sleep(5)
+                            resp = client.get(
+                                f"{credentials.backend_url}/api/dbt/session/status",
+                                headers=headers,
+                            )
+                            resp.raise_for_status()
+                            data = resp.json()
+                            if data["status"] == "ready":
+                                logger.info("Worker ready")
+                                break
+                            logger.info(data.get("message", "Provisioning worker..."))
+
+                        # Worker is ready, retry session creation
+                        resp = client.post(
+                            f"{credentials.backend_url}/api/dbt/session",
+                            headers=headers,
+                        )
+                        resp.raise_for_status()
+                        data = resp.json()
+
+                    cls._shared_session_id = data["session_id"]
 
                 if not cls._cleanup_registered:
                     atexit.register(cls._cleanup_session, credentials)
                     cls._cleanup_registered = True
 
-            worker_auth_token = (cls._shared_config or {}).get("worker_auth_token", credentials.auth_token)
             connection.handle = KolkhisHandle(
-                credentials.worker_url, cls._shared_session_id, credentials.auth_token,
-                credentials.backend_url, worker_auth_token,
+                credentials.backend_url, cls._shared_session_id, credentials.auth_token,
             )
             connection.state = ConnectionState.OPEN
 
@@ -311,11 +298,10 @@ class KolkhisConnectionManager(SQLConnectionManager):
         if cls._shared_session_id is None:
             return
         try:
-            worker_token = (cls._shared_config or {}).get("worker_auth_token", credentials.auth_token)
-            headers = {"Authorization": f"Bearer {worker_token}"}
+            headers = {"Authorization": f"Bearer {credentials.auth_token}"}
             with httpx.Client(timeout=10) as client:
                 client.delete(
-                    f"{credentials.worker_url}/session/{cls._shared_session_id}",
+                    f"{credentials.backend_url}/api/dbt/session/{cls._shared_session_id}",
                     headers=headers,
                 )
         except Exception:
