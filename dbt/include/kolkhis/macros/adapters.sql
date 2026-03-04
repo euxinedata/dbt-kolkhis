@@ -7,7 +7,7 @@
     {% set sql %}
         select schema_name
         from information_schema.schemata
-        where catalog_name = current_database()
+        where catalog_name = '{{ database }}'
     {% endset %}
     {{ return(run_query(sql)) }}
 {% endmacro %}
@@ -25,8 +25,8 @@
                 else table_type
             end as type
         from information_schema.tables
-        where table_schema = '{{ schema_relation.schema }}'
-          and table_catalog = current_database()
+        where table_catalog = '{{ schema_relation.database }}'
+          and table_schema = '{{ schema_relation.schema }}'
     {% endset %}
     {{ return(run_query(sql)) }}
 {% endmacro %}
@@ -41,7 +41,8 @@
             numeric_precision,
             numeric_scale
         from information_schema.columns
-        where table_name = '{{ relation.identifier }}'
+        where table_catalog = '{{ relation.database }}'
+          and table_name = '{{ relation.identifier }}'
           and table_schema = '{{ relation.schema }}'
         order by ordinal_position
     {% endset %}
@@ -51,7 +52,7 @@
 
 {% macro kolkhis__create_table_as(temporary, relation, sql) %}
     create {% if temporary -%}temporary {%- endif %} table
-        {{ relation.include(database=false) }}
+        {{ relation }}
     as (
         {{ sql }}
     )
@@ -59,7 +60,7 @@
 
 
 {% macro kolkhis__create_view_as(relation, sql) %}
-    create or replace view {{ relation.include(database=false) }} as (
+    create or replace view {{ relation }} as (
         {{ sql }}
     )
 {% endmacro %}
@@ -68,9 +69,9 @@
 {% macro kolkhis__drop_relation(relation) %}
     {%- call statement('drop_relation', auto_begin=False) -%}
         {% if relation.type == 'view' %}
-            drop view if exists {{ relation.include(database=false) }}
+            drop view if exists {{ relation }}
         {% elif relation.type == 'table' %}
-            drop table if exists {{ relation.include(database=false) }}
+            drop table if exists {{ relation }}
         {% endif %}
     {%- endcall -%}
 {% endmacro %}
@@ -79,10 +80,10 @@
 {% macro kolkhis__rename_relation(from_relation, to_relation) %}
     {%- call statement('rename_relation') -%}
         {% if from_relation.type == 'view' %}
-            alter view {{ from_relation.include(database=false) }}
+            alter view {{ from_relation }}
             rename to {{ to_relation.include(database=false, schema=false) }}
         {% else %}
-            alter table {{ from_relation.include(database=false) }}
+            alter table {{ from_relation }}
             rename to {{ to_relation.include(database=false, schema=false) }}
         {% endif %}
     {%- endcall -%}
@@ -91,13 +92,13 @@
 
 {% macro kolkhis__create_schema(relation) %}
     {%- call statement('create_schema') -%}
-        create schema if not exists {{ relation.without_identifier().include(database=false) }}
+        create schema if not exists {{ relation.without_identifier() }}
     {%- endcall -%}
 {% endmacro %}
 
 
 {% macro kolkhis__drop_schema(relation) %}
     {%- call statement('drop_schema') -%}
-        drop schema if exists {{ relation.without_identifier().include(database=false) }} cascade
+        drop schema if exists {{ relation.without_identifier() }} cascade
     {%- endcall -%}
 {% endmacro %}
