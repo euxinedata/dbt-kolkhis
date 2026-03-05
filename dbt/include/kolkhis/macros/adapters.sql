@@ -1,66 +1,54 @@
-{% macro kolkhis__current_timestamp() %}
-    now()
-{% endmacro %}
-
-
 {% macro kolkhis__list_schemas(database) %}
+    {# DuckDB's information_schema doesn't cover ATTACH'd Iceberg catalogs #}
     {% set sql %}
-        select schema_name
-        from information_schema.schemata
-        where catalog_name = '{{ database }}'
+        SELECT schema_name
+        FROM duckdb_schemas()
+        WHERE database_name = '{{ database }}'
     {% endset %}
     {{ return(run_query(sql)) }}
 {% endmacro %}
 
 
 {% macro kolkhis__list_relations_without_caching(schema_relation) %}
+    {# DuckDB's information_schema doesn't list Iceberg tables, use SHOW TABLES #}
     {% set sql %}
-        select
-            '{{ schema_relation.database }}' as database,
-            table_name as name,
-            table_schema as schema,
-            case table_type
-                when 'BASE TABLE' then 'table'
-                when 'VIEW' then 'view'
-                else table_type
-            end as type
-        from information_schema.tables
-        where table_catalog = '{{ schema_relation.database }}'
-          and table_schema = '{{ schema_relation.schema }}'
+        SHOW TABLES FROM {{ schema_relation.database }}."{{ schema_relation.schema }}"
     {% endset %}
-    {{ return(run_query(sql)) }}
+    {% set results = run_query(sql) %}
+    {% set relations = [] %}
+    {% for row in results %}
+        {% do relations.append({'database': schema_relation.database, 'name': row[0], 'schema': schema_relation.schema, 'type': 'table'}) %}
+    {% endfor %}
+    {{ return(relations) }}
 {% endmacro %}
 
 
 {% macro kolkhis__get_columns_in_relation(relation) %}
+    {# information_schema.columns doesn't work for ATTACH'd Iceberg catalogs.
+       Use DESCRIBE which returns column_name, column_type, null, key, default, extra. #}
     {% set sql %}
-        select
-            column_name,
-            data_type,
-            character_maximum_length,
-            numeric_precision,
-            numeric_scale
-        from information_schema.columns
-        where table_catalog = '{{ relation.database }}'
-          and table_name = '{{ relation.identifier }}'
-          and table_schema = '{{ relation.schema }}'
-        order by ordinal_position
+        DESCRIBE {{ relation }}
     {% endset %}
-    {{ return(run_query(sql)) }}
+    {% set result = run_query(sql) %}
+    {% set columns = [] %}
+    {% for row in result %}
+        {% do columns.append(api.Column.from_description(row['column_name'], row['column_type'])) %}
+    {% endfor %}
+    {% do return(columns) %}
 {% endmacro %}
 
 
 {% macro kolkhis__create_table_as(temporary, relation, sql) %}
-    create {% if temporary -%}temporary {%- endif %} table
+    CREATE {% if temporary -%}TEMPORARY {%- endif %} TABLE
         {{ relation.include(database=(not temporary), schema=(not temporary)) }}
-    as (
+    AS (
         {{ sql }}
     )
 {% endmacro %}
 
 
 {% macro kolkhis__create_view_as(relation, sql) %}
-    create or replace view {{ relation }} as (
+    CREATE OR REPLACE VIEW {{ relation }} AS (
         {{ sql }}
     )
 {% endmacro %}
@@ -69,22 +57,23 @@
 {% macro kolkhis__drop_relation(relation) %}
     {%- call statement('drop_relation', auto_begin=False) -%}
         {% if relation.type == 'view' %}
-            drop view if exists {{ relation }}
+            DROP VIEW IF EXISTS {{ relation }}
         {% elif relation.type == 'table' %}
-            drop table if exists {{ relation }}
+            DROP TABLE IF EXISTS {{ relation }}
         {% endif %}
     {%- endcall -%}
 {% endmacro %}
 
 
 {% macro kolkhis__rename_relation(from_relation, to_relation) %}
+    {# Iceberg tables don't support ALTER TABLE RENAME.
+       Only views can be renamed. Tables should use drop+create instead. #}
     {%- call statement('rename_relation') -%}
         {% if from_relation.type == 'view' %}
-            alter view {{ from_relation }}
-            rename to {{ to_relation.include(database=false, schema=false) }}
+            ALTER VIEW {{ from_relation }}
+            RENAME TO {{ to_relation.include(database=false, schema=false) }}
         {% else %}
-            alter table {{ from_relation }}
-            rename to {{ to_relation.include(database=false, schema=false) }}
+            {{ exceptions.raise_compiler_error("Renaming tables is not supported on Iceberg catalogs. Use drop+create instead.") }}
         {% endif %}
     {%- endcall -%}
 {% endmacro %}
@@ -92,13 +81,20 @@
 
 {% macro kolkhis__create_schema(relation) %}
     {%- call statement('create_schema') -%}
-        create schema if not exists {{ relation.without_identifier() }}
+        CREATE SCHEMA IF NOT EXISTS {{ relation.without_identifier() }}
     {%- endcall -%}
 {% endmacro %}
 
 
 {% macro kolkhis__drop_schema(relation) %}
     {%- call statement('drop_schema') -%}
-        drop schema if exists {{ relation.without_identifier() }} cascade
+        DROP SCHEMA IF EXISTS {{ relation.without_identifier() }} CASCADE
+    {%- endcall -%}
+{% endmacro %}
+
+
+{% macro kolkhis__truncate_relation(relation) %}
+    {%- call statement('truncate_relation') -%}
+        DELETE FROM {{ relation }} WHERE true
     {%- endcall -%}
 {% endmacro %}
