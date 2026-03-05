@@ -10,4 +10,5 @@ Plugin = AdapterPlugin(
     adapter=KolkhisAdapter,
     credentials=KolkhisCredentials,
     include_path=PACKAGE_PATH,
+    project_name="kolkhis",
 )
