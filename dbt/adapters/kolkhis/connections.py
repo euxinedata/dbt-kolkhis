@@ -1,7 +1,9 @@
 import logging
+import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
 import httpx
@@ -55,6 +57,30 @@ class KolkhisCursor:
 
     def _headers(self):
         return {"Authorization": f"Bearer {self._auth_token}"}
+
+    # ISO timestamp pattern: 2024-01-15T10:30:00, with optional fractional seconds and tz
+    _TS_RE = re.compile(
+        r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$"
+    )
+
+    @staticmethod
+    def _coerce_value(v: Any) -> Any:
+        """Coerce JSON-serialized values back to Python types.
+
+        Timestamps come as strings from the JSON API but dbt's freshness
+        checks expect datetime objects.
+        """
+        if not isinstance(v, str):
+            return v
+        if KolkhisCursor._TS_RE.match(v):
+            try:
+                dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            except ValueError:
+                pass
+        return v
 
     @staticmethod
     def _quote_value(v: Any) -> str:
@@ -141,8 +167,10 @@ class KolkhisCursor:
             (col, "VARCHAR", None, None, None, None, True)
             for col in columns
         ]
+        coerce = KolkhisCursor._coerce_value
         self._rows = [
-            tuple(row[col] for col in columns) for row in rows
+            tuple(coerce(row[col]) for col in columns)
+            for row in rows
         ]
         self.rowcount = results.get("total", len(self._rows))
 
@@ -221,6 +249,11 @@ class KolkhisConnectionManager(SQLConnectionManager):
         return AdapterResponse(
             _message="OK", rows_affected=cursor.rowcount
         )
+
+    @classmethod
+    def data_type_code_to_name(cls, type_code) -> str:
+        # Our cursor description already uses type name strings (e.g. "VARCHAR")
+        return str(type_code)
 
     def cancel(self, connection: Connection):
         pass
