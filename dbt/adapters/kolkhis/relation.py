@@ -7,9 +7,10 @@ from dbt.adapters.contracts.relation import RelationType
 
 @dataclass(frozen=True, eq=False, repr=False)
 class KolkhisRelation(BaseRelation):
-    # Iceberg tables don't support ALTER TABLE RENAME, so only views are renameable.
     renameable_relations: FrozenSet[RelationType] = field(
-        default_factory=lambda: frozenset({RelationType.View})
+        default_factory=lambda: frozenset(
+            {RelationType.Table, RelationType.View}
+        )
     )
     replaceable_relations: FrozenSet[RelationType] = field(
         default_factory=lambda: frozenset({RelationType.View})

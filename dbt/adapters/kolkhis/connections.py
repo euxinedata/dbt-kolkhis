@@ -1,8 +1,9 @@
-import atexit
 import logging
+import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
 import httpx
@@ -16,6 +17,9 @@ from dbt.adapters.sql.connections import SQLConnectionManager
 from dbt_common.exceptions import DbtRuntimeError
 
 logger = logging.getLogger(__name__)
+
+POLL_INTERVAL = 1.0
+QUERY_TIMEOUT = 300
 
 
 @dataclass
@@ -36,39 +40,139 @@ class KolkhisCredentials(Credentials):
 
 
 class KolkhisCursor:
-    """DB-API 2.0 style cursor that routes SQL through the backend."""
+    """DB-API 2.0 cursor that submits SQL via the backend queries API.
 
-    def __init__(self, backend_url: str, session_id: str, auth_token: str):
+    Each SQL statement is submitted as an independent job through
+    POST /api/queries, polled until complete, then results are fetched.
+    DuckLake persistence (PostgreSQL metadata + S3 data) ensures state
+    is visible across ephemeral connections.
+    """
+
+    def __init__(self, backend_url: str, auth_token: str):
         self._backend_url = backend_url
-        self._session_id = session_id
         self._auth_token = auth_token
         self.description: Optional[list] = None
         self._rows: list = []
         self.rowcount: int = -1
 
+    def _headers(self):
+        return {"Authorization": f"Bearer {self._auth_token}"}
+
+    # ISO timestamp pattern: 2024-01-15T10:30:00, with optional fractional seconds and tz
+    _TS_RE = re.compile(
+        r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$"
+    )
+
+    @staticmethod
+    def _coerce_value(v: Any) -> Any:
+        """Coerce JSON-serialized values back to Python types.
+
+        Timestamps come as strings from the JSON API but dbt's freshness
+        checks expect datetime objects.
+        """
+        if not isinstance(v, str):
+            return v
+        if KolkhisCursor._TS_RE.match(v):
+            try:
+                dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            except ValueError:
+                pass
+        return v
+
+    @staticmethod
+    def _quote_value(v: Any) -> str:
+        if v is None:
+            return "NULL"
+        if isinstance(v, bool):
+            return "TRUE" if v else "FALSE"
+        if isinstance(v, (int, float)):
+            return str(v)
+        # String — escape single quotes
+        return "'" + str(v).replace("'", "''") + "'"
+
     def execute(self, sql: str, bindings: Any = None):
         if bindings:
-            raise DbtRuntimeError("Parameterized queries not supported by Kolkhis adapter")
+            # Inline bind parameters into the SQL string.
+            # dbt seeds use %s or ? placeholders with agate row values.
+            parts = sql.split("%s") if "%s" in sql else sql.split("?")
+            if len(parts) == len(bindings) + 1:
+                sql = "".join(
+                    p + self._quote_value(b)
+                    for p, b in zip(parts[:-1], bindings)
+                ) + parts[-1]
+            else:
+                raise DbtRuntimeError(
+                    f"Binding count mismatch: {len(bindings)} bindings "
+                    f"for {len(parts) - 1} placeholders"
+                )
 
-        headers = {"Authorization": f"Bearer {self._auth_token}"}
-        with httpx.Client(timeout=300) as client:
+        with httpx.Client(timeout=QUERY_TIMEOUT) as client:
+            # Submit query
             resp = client.post(
-                f"{self._backend_url}/api/dbt/session/{self._session_id}/query",
-                json={"sql": sql, "fetch_results": True},
-                headers=headers,
+                f"{self._backend_url}/api/queries",
+                json={"sql": sql},
+                headers=self._headers(),
             )
             resp.raise_for_status()
             data = resp.json()
 
-        if data.get("status") == "failed":
-            raise DbtRuntimeError(data.get("error", "Query failed"))
+            # DDL returns immediately
+            if "ddl_message" in data:
+                self.description = [
+                    ("message", "VARCHAR", None, None, None, None, True)
+                ]
+                self._rows = [(data["ddl_message"],)]
+                self.rowcount = 0
+                return
 
-        columns = data.get("columns") or []
-        rows = data.get("rows") or []
+            job_id = data["job_id"]
 
-        self.description = [(col["name"], col.get("type", "VARCHAR")) for col in columns]
-        self._rows = [tuple(row) for row in rows]
-        self.rowcount = data.get("row_count", len(self._rows))
+            # Poll until complete
+            deadline = time.time() + QUERY_TIMEOUT
+            while time.time() < deadline:
+                time.sleep(POLL_INTERVAL)
+                r = client.get(
+                    f"{self._backend_url}/api/queries/{job_id}",
+                    headers=self._headers(),
+                )
+                r.raise_for_status()
+                job = r.json()
+
+                if job["status"] == "failed":
+                    raise DbtRuntimeError(
+                        job.get("error", "Query failed")
+                    )
+                if job["status"] == "completed":
+                    break
+            else:
+                raise DbtRuntimeError(
+                    f"Query timed out after {QUERY_TIMEOUT}s"
+                )
+
+            # Fetch results
+            r = client.get(
+                f"{self._backend_url}/api/queries/{job_id}/results",
+                headers=self._headers(),
+            )
+            r.raise_for_status()
+            results = r.json()
+
+        columns = results.get("columns") or []
+        rows = results.get("rows") or []
+
+        self.description = [
+            (col, "VARCHAR", None, None, None, None, True)
+            for col in columns
+        ]
+        coerce = KolkhisCursor._coerce_value
+        self._rows = [
+            tuple(coerce(row[col]) for col in columns)
+            for row in rows
+        ]
+        self.rowcount = results.get("total", len(self._rows))
 
     def fetchall(self):
         return self._rows
@@ -88,15 +192,14 @@ class KolkhisCursor:
 
 
 class KolkhisHandle:
-    """Connection handle that creates cursors for the worker session."""
+    """Connection handle that creates cursors."""
 
-    def __init__(self, backend_url: str, session_id: str, auth_token: str):
+    def __init__(self, backend_url: str, auth_token: str):
         self.backend_url = backend_url
-        self.session_id = session_id
         self.auth_token = auth_token
 
     def cursor(self):
-        return KolkhisCursor(self.backend_url, self.session_id, self.auth_token)
+        return KolkhisCursor(self.backend_url, self.auth_token)
 
     def close(self):
         pass
@@ -104,9 +207,6 @@ class KolkhisHandle:
 
 class KolkhisConnectionManager(SQLConnectionManager):
     TYPE = "kolkhis"
-
-    _shared_session_id: Optional[str] = None
-    _cleanup_registered: bool = False
 
     def begin(self):
         connection = self.get_thread_connection()
@@ -127,54 +227,33 @@ class KolkhisConnectionManager(SQLConnectionManager):
         if connection.state == ConnectionState.OPEN:
             return connection
 
-        credentials: KolkhisCredentials = connection.credentials
-        headers = {"Authorization": f"Bearer {credentials.auth_token}"}
+        credentials = connection.credentials
 
         try:
-            if cls._shared_session_id is None:
-                with httpx.Client(timeout=300) as client:
-                    resp = client.post(
-                        f"{credentials.backend_url}/api/dbt/session",
-                        headers=headers,
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    cls._shared_session_id = data["session_id"]
-
-                if not cls._cleanup_registered:
-                    atexit.register(cls._cleanup_session, credentials)
-                    cls._cleanup_registered = True
-
             connection.handle = KolkhisHandle(
-                credentials.backend_url, cls._shared_session_id, credentials.auth_token,
+                credentials.backend_url,
+                credentials.auth_token,
             )
             connection.state = ConnectionState.OPEN
-
         except Exception as exc:
             connection.handle = None
             connection.state = ConnectionState.FAIL
-            raise DbtRuntimeError(f"Failed to open Kolkhis connection: {exc}") from exc
+            raise DbtRuntimeError(
+                f"Failed to open Kolkhis connection: {exc}"
+            ) from exc
 
         return connection
 
     @classmethod
-    def _cleanup_session(cls, credentials: KolkhisCredentials):
-        if cls._shared_session_id is None:
-            return
-        try:
-            headers = {"Authorization": f"Bearer {credentials.auth_token}"}
-            with httpx.Client(timeout=10) as client:
-                client.delete(
-                    f"{credentials.backend_url}/api/dbt/session/{cls._shared_session_id}",
-                    headers=headers,
-                )
-        except Exception:
-            pass
-        cls._shared_session_id = None
+    def get_response(cls, cursor: KolkhisCursor) -> AdapterResponse:
+        return AdapterResponse(
+            _message="OK", rows_affected=cursor.rowcount
+        )
 
     @classmethod
-    def get_response(cls, cursor: KolkhisCursor) -> AdapterResponse:
-        return AdapterResponse(_message="OK", rows_affected=cursor.rowcount)
+    def data_type_code_to_name(cls, type_code) -> str:
+        # Our cursor description already uses type name strings (e.g. "VARCHAR")
+        return str(type_code)
 
     def cancel(self, connection: Connection):
         pass
@@ -184,10 +263,16 @@ class KolkhisConnectionManager(SQLConnectionManager):
         try:
             yield
         except httpx.HTTPStatusError as exc:
-            raise DbtRuntimeError(f"HTTP error executing SQL: {exc}") from exc
+            raise DbtRuntimeError(
+                f"HTTP error executing SQL: {exc}"
+            ) from exc
         except httpx.TransportError as exc:
-            raise DbtRuntimeError(f"Connection error: {exc}") from exc
+            raise DbtRuntimeError(
+                f"Connection error: {exc}"
+            ) from exc
         except DbtRuntimeError:
             raise
         except Exception as exc:
-            raise DbtRuntimeError(f"Error executing SQL: {exc}") from exc
+            raise DbtRuntimeError(
+                f"Error executing SQL: {exc}"
+            ) from exc

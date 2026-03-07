@@ -3,8 +3,9 @@
   {%- set existing_relation = load_cached_relation(this) -%}
   {%- set target_relation = this.incorporate(type='table') -%}
   {# Use a regular staging table in the same schema instead of TEMPORARY.
-     DuckDB TEMPORARY tables live in a separate catalog and can't be referenced
-     alongside ATTACH'd Iceberg tables in the same query. #}
+     Each SQL statement runs in its own DuckDB connection, so TEMPORARY tables
+     are not visible across statements. A real DuckLake table persists in
+     PostgreSQL metadata and is visible from any connection. #}
   {%- set temp_relation = make_intermediate_relation(target_relation) -%}
 
   {%- set unique_key = config.get('unique_key') -%}
@@ -25,7 +26,7 @@
       -- First run: create the table directly
       {% set build_sql = get_create_table_as_sql(False, target_relation, sql) %}
   {% elif full_refresh_mode %}
-      -- Full refresh: drop and recreate (Iceberg doesn't support rename)
+      -- Full refresh: drop and recreate
       {% do adapter.drop_relation(existing_relation) %}
       {% set build_sql = get_create_table_as_sql(False, target_relation, sql) %}
   {% else %}
