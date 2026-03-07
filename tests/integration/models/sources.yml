@@ -1,0 +1,13 @@
+version: 2
+sources:
+  - name: retail_products
+    database: retail_catalog
+    schema: products
+    tables:
+      - name: categories
+      - name: brands
+      - name: products
+        loaded_at_field: "now()"
+        freshness:
+          warn_after: {count: 24, period: hour}
+          error_after: {count: 48, period: hour}

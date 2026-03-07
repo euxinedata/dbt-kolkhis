@@ -1,0 +1,9 @@
+kolkhis_test:
+  target: dev
+  outputs:
+    dev:
+      type: kolkhis
+      backend_url: "{{ env_var('KOLKHIS_BACKEND_URL', 'http://localhost:8000') }}"
+      auth_token: "{{ env_var('KOLKHIS_AUTH_TOKEN') }}"
+      database: development
+      schema: "dbt_{{ env_var('DBT_USER', 'test') }}"

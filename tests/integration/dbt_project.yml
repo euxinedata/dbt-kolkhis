@@ -1,0 +1,14 @@
+name: test_kolkhis
+version: 0.1.0
+config-version: 2
+profile: kolkhis_test
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+dispatch:
+  - macro_namespace: dbt
+    search_order: ['kolkhis', 'dbt']
