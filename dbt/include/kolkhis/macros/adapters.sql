@@ -1,5 +1,4 @@
 {% macro kolkhis__list_schemas(database) %}
-    {# DuckDB's information_schema doesn't cover ATTACH'd Iceberg catalogs #}
     {% set sql %}
         SELECT schema_name
         FROM duckdb_schemas()
@@ -10,22 +9,27 @@
 
 
 {% macro kolkhis__list_relations_without_caching(schema_relation) %}
-    {# DuckDB's information_schema doesn't list Iceberg tables, use SHOW TABLES #}
     {% set sql %}
-        SHOW TABLES FROM {{ schema_relation.database }}."{{ schema_relation.schema }}"
+        SELECT table_name, table_type
+        FROM information_schema.tables
+        WHERE table_catalog = '{{ schema_relation.database }}'
+          AND table_schema = '{{ schema_relation.schema }}'
     {% endset %}
     {% set results = run_query(sql) %}
     {% set relations = [] %}
     {% for row in results %}
-        {% do relations.append({'database': schema_relation.database, 'name': row[0], 'schema': schema_relation.schema, 'type': 'table'}) %}
+        {% if row['table_type'] == 'VIEW' %}
+            {% set rel_type = 'view' %}
+        {% else %}
+            {% set rel_type = 'table' %}
+        {% endif %}
+        {% do relations.append({'database': schema_relation.database, 'name': row['table_name'], 'schema': schema_relation.schema, 'type': rel_type}) %}
     {% endfor %}
     {{ return(relations) }}
 {% endmacro %}
 
 
 {% macro kolkhis__get_columns_in_relation(relation) %}
-    {# information_schema.columns doesn't work for ATTACH'd Iceberg catalogs.
-       Use DESCRIBE which returns column_name, column_type, null, key, default, extra. #}
     {% set sql %}
         DESCRIBE {{ relation }}
     {% endset %}
@@ -66,14 +70,13 @@
 
 
 {% macro kolkhis__rename_relation(from_relation, to_relation) %}
-    {# Iceberg tables don't support ALTER TABLE RENAME.
-       Only views can be renamed. Tables should use drop+create instead. #}
     {%- call statement('rename_relation') -%}
         {% if from_relation.type == 'view' %}
             ALTER VIEW {{ from_relation }}
             RENAME TO {{ to_relation.include(database=false, schema=false) }}
         {% else %}
-            {{ exceptions.raise_compiler_error("Renaming tables is not supported on Iceberg catalogs. Use drop+create instead.") }}
+            ALTER TABLE {{ from_relation }}
+            RENAME TO {{ to_relation.include(database=false, schema=false) }}
         {% endif %}
     {%- endcall -%}
 {% endmacro %}

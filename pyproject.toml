@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dbt-kolkhis"
-version = "0.5.0"
-description = "dbt adapter for Kolkhis DuckDB worker"
+version = "1.0.0"
+description = "dbt adapter for Kolkhis (routes SQL through backend API to DuckLake worker)"
 requires-python = ">=3.10"
 dependencies = [
     "dbt-core>=1.8",

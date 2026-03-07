@@ -29,4 +29,4 @@ class KolkhisColumn(Column):
     def numeric_type(cls, dtype: str, precision: Any, scale: Any) -> str:
         if precision is None or scale is None:
             return dtype
-        return "{}({},{})".format(dtype, precision, scale)
+        return f"{dtype}({precision},{scale})"

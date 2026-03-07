@@ -49,8 +49,6 @@ class KolkhisAdapter(SQLAdapter):
         return "TIME"
 
     def list_schemas(self, database: str) -> List[str]:
-        # DuckDB's information_schema doesn't cover ATTACH'd Iceberg catalogs.
-        # Use duckdb_schemas() which does enumerate them.
         db = database.strip('"')
         sql = (
             "SELECT schema_name "
@@ -65,8 +63,6 @@ class KolkhisAdapter(SQLAdapter):
         return schema.lower() in [s.lower() for s in results]
 
     def get_columns_in_relation(self, relation):
-        # DuckDB's information_schema.columns doesn't cover ATTACH'd Iceberg
-        # catalogs. Use DESCRIBE which works for all DuckDB table types.
         sql = f"DESCRIBE {relation}"
         try:
             _, table = self.execute(sql, fetch=True)
@@ -80,30 +76,37 @@ class KolkhisAdapter(SQLAdapter):
     def list_relations_without_caching(
         self, schema_relation: BaseRelation
     ) -> List[BaseRelation]:
-        # DuckDB's information_schema doesn't list tables from ATTACH'd Iceberg
-        # catalogs. Use SHOW TABLES FROM which does work.
         db = schema_relation.database
         schema = schema_relation.schema
-        sql = f'SHOW TABLES FROM {db}."{schema}"'
+        sql = (
+            f"SELECT table_name, table_type "
+            f"FROM information_schema.tables "
+            f"WHERE table_catalog = '{db}' AND table_schema = '{schema}'"
+        )
         _, table = self.execute(sql, fetch=True)
 
         relations = []
         for row in table:
             name = row[0]
+            table_type = row[1]
+            rel_type = "view" if table_type == "VIEW" else "table"
             relations.append(
                 self.Relation.create(
                     database=db,
                     schema=schema,
                     identifier=name,
-                    quote_policy={"database": True, "schema": True, "identifier": True},
-                    type=self.Relation.get_relation_type("table"),
+                    quote_policy={
+                        "database": True,
+                        "schema": True,
+                        "identifier": True,
+                    },
+                    type=self.Relation.get_relation_type(rel_type),
                 )
             )
         return relations
 
     def valid_incremental_strategies(self):
-        # DuckDB's Iceberg extension doesn't support MERGE INTO.
-        return ["append", "delete+insert"]
+        return ["append", "delete+insert", "merge"]
 
     def debug_query(self) -> None:
         self.execute("SELECT 1 AS id")
